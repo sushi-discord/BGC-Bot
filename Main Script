@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ---------------- CONFIGURATION ----------------
 # !!! REPLACE WITH YOUR ACTUAL BOT TOKEN !!!
-DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE" 
+DISCORD_TOKEN = "MTQ0NjM3MjQzMjI0NzI2MzI2Mg.GKd7L9.rRx9jABgB_vpZcmHm1kuit16XVvcLI9V0RUpKw" 
 
 # Roblox-specific configuration (Groups and Badges)
 IRF_BADGE_IDS = {740669344, 740670240, 740670075}
