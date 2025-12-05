@@ -1,0 +1,373 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import aiohttp
+import nest_asyncio
+import requests
+import json
+import time
+import random
+import os
+from dateutil.parser import isoparse
+from datetime import datetime
+import asyncio
+import nest_asyncio
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import logging
+from typing import List, Dict
+import io # Used for sending plot image to Discord
+
+# --- DEPENDENCY SETUP (Install using pip: aiohttp, python-dateutil, nest_asyncio, requests, matplotlib, discord.py) ---
+# This block is for reference; ensure these dependencies are installed in your environment.
+# ----------------------------------------------------------------------------------------------------------------------
+
+nest_asyncio.apply()
+logging.basicConfig(level=logging.INFO)
+
+# ---------------- CONFIGURATION ----------------
+# !!! REPLACE WITH YOUR ACTUAL BOT TOKEN !!!
+DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE" 
+
+# Roblox-specific configuration (Groups and Badges)
+IRF_BADGE_IDS = {740669344, 740670240, 740670075}
+
+IRF_GROUP_IDS = [
+    872876, 4995197, 3029096, 5248401, 9490336, 33639347, 5188033, 33411343,
+    14270603, 33453151, 6232598, 10410001, 10436572, 10421203, 13475897,
+    10421433, 32419298, 10880766, 16264703, 32856407, 33353962, 33233078,
+    32838140, 10409578, 3052496, 5291387, 5181928, 5217820, 5225010,
+    5458754, 2527987, 4899462
+]
+
+ENEMY_GROUP_IDS = [35439419, 4886107, 33658648, 5248163]
+
+# ---------------- ROBBLOX API ASYNC FUNCTIONS ----------------
+
+async def fetch_json(session, url, method="GET", **kwargs):
+    """
+    Fetches JSON data with infinite retries on 429 (Rate Limit) using 
+    a GENTLE exponential backoff and increased jitter.
+    """
+    attempt = 0
+    while True:
+        async with session.request(method, url, **kwargs) as res:
+            if res.status == 429:
+                retry_after = int(res.headers.get("Retry-After", 4))
+                
+                # GENTLER Exponential Backoff: Base time 3s, multiplier 2^attempt
+                backoff_time = 3 * (2 ** attempt) 
+                
+                # Use the larger of the two values, plus INCREASED random jitter (1.0 to 3.0s)
+                sleep_time = max(retry_after, backoff_time) + random.uniform(1.0, 3.0)
+                
+                logging.warning(f"Rate limited (Attempt {attempt+1}). Retrying in {sleep_time:.2f}s...")
+                await asyncio.sleep(sleep_time)
+                attempt += 1
+                continue
+            
+            try:
+                res.raise_for_status()
+                return await res.json()
+            except aiohttp.ClientResponseError as e:
+                logging.error(f"HTTP Error {e.status} for {url}: {e.message}")
+                raise
+
+async def get_user_id(session, username: str) -> str:
+    url = "https://users.roblox.com/v1/usernames/users"
+    data = await fetch_json(session, url, "POST", json={"usernames": [username]})
+    if data["data"]:
+        return data["data"][0]["id"]
+    raise ValueError(f"User not found: {username}")
+
+async def fetch_account_stats(session, user_id: str):
+    """Fetches core user stats resiliently."""
+    url = f"https://users.roblox.com/v1/users/{user_id}"
+    data = await fetch_json(session, url)
+    
+    created_date = isoparse(data["created"])
+    now = datetime.now(created_date.tzinfo)
+    age_days = (now - created_date).days
+
+    followers, friends = "N/A", "N/A"
+
+    try:
+        followers_url = f"https://friends.roblox.com/v1/users/{user_id}/followers"
+        followers_data = await fetch_json(session, followers_url, params={"limit": 1})
+        followers = followers_data.get("totalCount", "N/A")
+    except Exception:
+        pass # Ignore failure
+
+    try:
+        friends_url = f"https://friends.roblox.com/v1/users/{user_id}/friends"
+        friends_data = await fetch_json(session, friends_url, params={"limit": 1})
+        friends = friends_data.get("totalCount", "N/A")
+    except Exception:
+        pass # Ignore failure
+
+    return age_days, followers, friends, data.get("name", "N/A")
+
+async def fetch_prior_usernames(session, user_id: str) -> List[str]:
+    """Fetches list of prior usernames."""
+    url = f"https://users.roblox.com/v1/users/{user_id}/username-history?limit=100&sortOrder=Desc"
+    usernames, cursor = [], None
+    while True:
+        params = {"cursor": cursor} if cursor else {}
+        data = await fetch_json(session, url, params=params)
+        usernames.extend(data["data"])
+        cursor = data.get("nextPageCursor")
+        if not cursor:
+            break
+    return [u['name'] for u in usernames]
+
+async def fetch_badges(session, user_id: str) -> List[Dict]:
+    url = f"https://badges.roblox.com/v1/users/{user_id}/badges?limit=100&sortOrder=Desc"
+    badges, cursor = [], None
+    while True:
+        params = {"cursor": cursor} if cursor else {}
+        data = await fetch_json(session, url, params=params)
+        badges.extend(data["data"])
+        cursor = data.get("nextPageCursor")
+        if not cursor:
+            break
+    return badges
+
+async def fetch_award_dates(session, user_id: str, badges: List[Dict]):
+    dates, highlight_dates = [], []
+    badge_ids = [b["id"] for b in badges]
+
+    async def get_batch(batch):
+        url = f"https://badges.roblox.com/v1/users/{user_id}/badges/awarded-dates"
+        data = await fetch_json(session, url, params={"badgeIds": batch})
+        for itm in data.get("data", []):
+            dt = itm.get("awardedDate")
+            if not dt: continue
+            dates.append(dt)
+            if itm["badgeId"] in IRF_BADGE_IDS:
+                highlight_dates.append(isoparse(dt))
+
+    batch_size = 100
+    await asyncio.gather(*(get_batch(badge_ids[i:i + batch_size])
+                           for i in range(0, len(badge_ids), batch_size)))
+    return dates, highlight_dates
+
+async def fetch_groups(session, user_id: str):
+    url = f"https://groups.roblox.com/v1/users/{user_id}/groups/roles"
+    data = await fetch_json(session, url)
+    irf, enemy = [], []
+    for g in data["data"]:
+        gid = g["group"]["id"]
+        name = g["group"]["name"]
+        rank = g["role"]["name"]
+        if gid in IRF_GROUP_IDS:
+            irf.append(f"{name} - {rank}")
+        if gid in ENEMY_GROUP_IDS:
+            enemy.append(f"{name} - {rank} (ID:{gid})")
+    return irf, enemy
+
+# ---------------- SYNCHRONOUS FUNCTIONS (for Executor) ----------------
+
+# Synchronous version of ID fetch for Trello-check dependency
+def get_roblox_user_id_sync(username):
+    url = f"https://users.roblox.com/v1/usernames/users"
+    payload = {"usernames": [username], "excludeBannedUsers": True}
+    response = requests.post(url, json=payload) 
+    response.raise_for_status()
+    data = response.json()
+    if "data" in data and len(data["data"]) > 0:
+        return data["data"][0]["id"], data["data"][0]["name"]
+    return None, None
+
+def get_friends(user_id):
+    url = f"https://friends.roblox.com/v1/users/{user_id}/friends"
+    response = requests.get(url) 
+    if response.status_code == 200:
+        data = response.json()
+        return {friend["name"].strip(): friend["id"] for friend in data.get("data", [])}
+    return {}
+
+def get_trello_blacklist():
+    url = "https://trello.com/b/ov7HU6Pv.json"
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+    blacklisted_names = {}
+    active_card_ids = {card["id"] for card in data.get("cards", []) if not card.get("closed", False)}
+    for card in data.get("cards", []):
+        is_archived = card["id"] not in active_card_ids
+        for list_item in data.get("lists", []):
+            if card["idList"] == list_item["id"]:
+                status_suffix = " (Archived/Inactive Punishment)" if is_archived else ""
+                blacklisted_names[card["name"].strip().lower()] = (card["name"].strip(), list_item["name"] + status_suffix)
+    return blacklisted_names
+
+def check_friends_against_blacklist(friends, blacklist):
+    flagged_friends = []
+    for friend_name, friend_id in friends.items():
+        lower_friend_name = friend_name.lower()
+        if lower_friend_name in blacklist:
+            accurate_name, list_type = blacklist[lower_friend_name]
+            flagged_friends.append((accurate_name, list_type, friend_id))
+    return flagged_friends
+
+def plot_graph_sync(username, user_id, dates, highlights):
+    """Generates the plot and saves it to a BytesIO object."""
+    awarded = sorted(isoparse(d) for d in dates)
+    cumulative = list(range(1, len(awarded) + 1))
+    
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    ax.scatter(awarded, cumulative, marker='o', alpha=0.2, label=None)
+    
+    first_legend = True
+    lookup = {d: i for i, d in enumerate(awarded)}
+    
+    for h in highlights:
+        idx = lookup.get(h)
+        if idx is not None:
+            ax.scatter(awarded[idx], cumulative[idx], marker='o', color="lime", s=50, 
+                       label="IRF Game Badge" if first_legend else "")
+            first_legend = False
+
+    ax.set_title(f"Badges over Time for {username} ({user_id})")
+    ax.set_xlabel("Badge Earned Date")
+    ax.set_ylabel("Total Badges")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.text(0.05, 0.95, f"Badge Count: {len(cumulative)}",
+            transform=ax.transAxes, color="white", ha="left", va="top")
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    
+    # Save figure to a BytesIO buffer
+    image_buffer = io.BytesIO()
+    plt.savefig(image_buffer, format='png')
+    image_buffer.seek(0)
+    plt.close(fig) # Close the figure to free memory
+    return image_buffer
+
+# ---------------- SYNCHRONOUS Trello Wrapper ----------------
+
+def check_trello_sync(username):
+    """Bundles synchronous Trello logic for the executor."""
+    try:
+        roblox_id, accurate_username = get_roblox_user_id_sync(username)
+        if not roblox_id:
+            return "❌ User ID not resolvable for friend check."
+        
+        friends_sync = get_friends(roblox_id)
+        blacklist = get_trello_blacklist()
+        flagged = check_friends_against_blacklist(friends_sync, blacklist)
+        
+        output = f"Checked **{len(friends_sync)}** friends against Trello list.\n"
+        output += f"**--- ⚠️ TRELLO BLACKLIST RESULTS ---**\n"
+        
+        if flagged:
+            output += "🚨 **Flagged Friends Found!**\n"
+            for name, list_type, fid in flagged:
+                output += f" • `{name}` - **{list_type}** - ROBLOX ID: {fid}\n"
+        else:
+            output += "✅ No flagged friends found on Trello list."
+        return output
+    except Exception as e:
+        return f"❌ Failed Step 6 (Trello check): An internal error occurred: `{e}`"
+
+# ---------------- DISCORD BOT COMMAND ----------------
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Bot connected as {bot.user} (ID: {bot.user.id})')
+    # Sync the command tree to register the slash command
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands.")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
+    print('-------------------------------------------')
+
+@bot.tree.command(name='bgc_robloxusername', description='Performs a full BGC analysis on a Roblox username.')
+@app_commands.describe(username='The Roblox username to analyze (e.g., wawapepe).')
+async def roblox_check(interaction: discord.Interaction, username: str):
+    """Performs a full analysis on a Roblox username, triggered by a slash command."""
+    
+    # Defer the interaction immediately since the command is long-running
+    await interaction.response.defer() 
+    
+    await interaction.followup.send(f"🔎 Starting full analysis for **{username}**... This may take a moment.")
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            # --- STEP 1 & 2: Get ID, Stats, and History ---
+            await interaction.followup.send("➡️ **Step 1/6 & 2/6**: Fetching ID, Account Stats, and Prior Usernames...")
+            
+            user_id = await get_user_id(session, username) 
+            age_days, followers, friends, accurate_name = await fetch_account_stats(session, user_id)
+            prior_names = await fetch_prior_usernames(session, user_id)
+            
+            # --- Format Basic Stats ---
+            prior_names_str = f"Prior Usernames: {', '.join(prior_names)}" if prior_names else "No prior usernames found."
+            stats_output = (
+                f"✅ **Roblox ID**: `{user_id}`\n"
+                f"✅ **Account Age**: {age_days:,} days\n"
+                f"✅ **Followers**: {followers} | **Friends**: {friends}\n"
+                f"✅ **History**: {prior_names_str}"
+            )
+            await interaction.followup.send(stats_output)
+
+            # --- STEP 3 & 4: Badges and Dates ---
+            await interaction.followup.send("➡️ **Step 3/6 & 4/6**: Fetching Badges and Award Dates...")
+            badges = await fetch_badges(session, user_id)
+            dates, highlights = await fetch_award_dates(session, user_id, badges)
+            await interaction.followup.send(f"✅ Found **{len(badges)}** badges. Generating graph...")
+
+            # --- PLOTTING (CPU-Bound, run in executor) ---
+            if dates:
+                await interaction.followup.send("📈 **Plotting Badge Graph** (Running in background thread)...")
+                image_buffer = await bot.loop.run_in_executor(
+                    None, plot_graph_sync, username, user_id, dates, highlights
+                )
+                await interaction.followup.send(file=discord.File(image_buffer, filename="badge_graph.png"))
+            else:
+                await interaction.followup.send("⚠️ Not enough badge data to plot graph.")
+
+            # --- STEP 5: Group Info ---
+            await interaction.followup.send("➡️ **Step 5/6**: Fetching Group Memberships...")
+            irf_groups, enemy_groups = await fetch_groups(session, user_id)
+
+            group_output = "**--- 👥 GROUP MEMBERSHIPS ---**\n"
+            group_output += "**IRF Groups:**\n"
+            group_output += "\n".join([f" • {g}" for g in irf_groups]) if irf_groups else " • None\n"
+            group_output += "\n**Enemy Groups:**\n"
+            group_output += "\n".join([f" • {g}" for g in enemy_groups]) if enemy_groups else " • None\n"
+            await interaction.followup.send(group_output)
+            
+            # --- STEP 6: Trello Blacklist Check (Synchronous, run in executor) ---
+            await interaction.followup.send("➡️ **Step 6/6**: Trello Blacklist Check (Friends)...")
+            
+            check_result = await bot.loop.run_in_executor(
+                None, check_trello_sync, username
+            )
+            await interaction.followup.send(check_result)
+
+            await interaction.followup.send(f"🏁 **Analysis for {username} Complete!**")
+
+        except ValueError as e:
+            await interaction.followup.send(f"❌ **Error:** {e}")
+        except Exception as e:
+            await interaction.followup.send(f"❌ An unexpected error occurred: `{e}`. Check the console for details.")
+
+# ---------------- RUN BOT ----------------
+if __name__ == '__main__':
+    # You must replace DISCORD_TOKEN with your actual bot token
+    if DISCORD_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
+        print("\n!!! ERROR: Please replace DISCORD_TOKEN with your actual bot token. !!!\n")
+    else:
+        try:
+            bot.run(DISCORD_TOKEN)
+        except discord.errors.LoginFailure:
+            print("\n!!! ERROR: Invalid Discord token. Please check your token and retry. !!!\n")
