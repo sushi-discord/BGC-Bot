@@ -1,0 +1,6 @@
+discord.py
+aiohttp
+nest_asyncio
+requests
+python-dateutil
+matplotlib
